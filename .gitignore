@@ -6,3 +6,5 @@
 *test*
 *.pth
 *.docx
+tva_alignment.ipynb
+old_implementation.py
