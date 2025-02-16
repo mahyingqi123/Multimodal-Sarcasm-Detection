@@ -10,6 +10,9 @@ import os
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 
+# Precision: 85.7 ± 4.8 (variance: 0.2322)
+# Recall: 85.6 ± 4.8 (variance: 0.2347)
+# F1: 85.6 ± 4.8 (variance: 0.2352)
 
 TEXT_INDEX = 0
 VIDEO_INDEX = 1
@@ -100,10 +103,11 @@ def load_data(data_input, data_output,train_ind_SI, author_ind):
     train_raw_video = getData(RAW_VIDEO_INDEX)
     train_raw_audio = getData(RAW_AUDIO_INDEX)
     authors = getData(SPEAKER_INDEX)
+
     UNK_AUTHOR_ID = author_ind["PERSON"]
     authors = [author_ind.get(author.strip(), UNK_AUTHOR_ID) for author in authors]
     authors = oneHot(authors, len(author_ind))
-    train_dataset = MultiModalDataset(train_text_feature, train_video_feature, train_audio_feature, train_raw_text, train_raw_video, train_raw_audio, train_out)
+    train_dataset = MultiModalDataset(train_text_feature, train_video_feature, train_audio_feature, train_raw_text, train_raw_video, train_raw_audio,train_out)
 
     train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
     return train_dataLoader
@@ -125,9 +129,9 @@ class SimpleNN(nn.Module):
         x = self.output(x)
         return x
     
-class RawFusionNetwork(nn.Module):
+class IntermediateFusionNetwork(nn.Module):
     def __init__(self, text_dim=1024, vision_dim=1024, audio_dim=1024, hidden_dim=256, num_classes=2):
-        super(RawFusionNetwork, self).__init__()
+        super(IntermediateFusionNetwork, self).__init__()
         
         total_dim = text_dim + vision_dim + audio_dim
         self.fusion = nn.Sequential(
@@ -148,7 +152,7 @@ class RawFusionNetwork(nn.Module):
         return self.fusion(combined)
     
 class EarlyFusionNetwork(nn.Module):
-    def __init__(self, text_dim=512, vision_dim=512, audio_dim=1024, hidden_dim=256, num_classes=2):
+    def __init__(self, text_dim=1024, vision_dim=1024, audio_dim=1024, hidden_dim=256, num_classes=2):
         super(EarlyFusionNetwork, self).__init__()
         
         total_dim = text_dim + vision_dim + audio_dim
@@ -170,23 +174,29 @@ class EarlyFusionNetwork(nn.Module):
         return self.fusion(combined)
 
 class LateFusionNetwork(nn.Module):
-    def __init__(self, fold = 0):
+    def __init__(self, fold = 0, vision_dim=512, text_dim=512, audio_dim=1024):
         super(LateFusionNetwork, self).__init__()
         # Deeper processing branches for each modality
-        self.text_branch = SimpleNN(512, 256, 2)
+        self.text_branch = SimpleNN(text_dim, 256, 2)
         self.text_branch.load_state_dict(torch.load('model/text/text_model_fold_'+str(fold)+'.pt'))
         self.text_branch.eval()
         
-        self.vision_branch = SimpleNN(512, 256, 2)
+        self.vision_branch = SimpleNN(vision_dim, 256, 2)
         self.vision_branch.load_state_dict(torch.load('model/visual/visual_model_fold_'+str(fold)+'.pt'))
         self.vision_branch.eval()
 
-        self.audio_branch = SimpleNN(1024, 256, 2)
+        self.audio_branch = SimpleNN(audio_dim, 256, 2)
         self.audio_branch.load_state_dict(torch.load('model/audio/audio_model_fold_'+str(fold)+'.pt'))
         self.audio_branch.eval()
         # Fusion layer
 
-        self.classifier = nn.Linear(2 * 3, 2)
+        self.attention = nn.Sequential(
+            nn.Linear(6, 16),
+            nn.ReLU(),
+            nn.Linear(16, 3)
+        )
+
+        self.classifier = nn.Linear(2, 2)
     
     def forward(self, text, vision, audio):
         # Process each modality independently
@@ -196,9 +206,17 @@ class LateFusionNetwork(nn.Module):
         
         # Concatenate and apply attention
         combined = torch.cat([text_features, vision_features, audio_features], dim=1)
+
+        attn_scores = self.attention(combined)
+
+        attn_weights = torch.softmax(attn_scores, dim=1)
+
+        stacked = torch.stack([text_features, vision_features, audio_features], dim=1)
+        
+        attended_features = (stacked * attn_weights.unsqueeze(-1)).sum(dim=1)
         
         # Final classification
-        return self.classifier(combined)
+        return self.classifier(attended_features)
 
 
 class HybridFusionNetwork(nn.Module):
@@ -206,7 +224,7 @@ class HybridFusionNetwork(nn.Module):
         super(HybridFusionNetwork, self).__init__()
         
         # Load pretrained models
-        self.late_fusion = LateFusionNetwork(fold + 1)
+        self.late_fusion = LateFusionNetwork(fold,vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size'])
         self.late_fusion.load_state_dict(torch.load(f"model/late/late_fusion_{fold}.pt"))
         self.late_fusion.eval()
         
@@ -214,9 +232,13 @@ class HybridFusionNetwork(nn.Module):
         self.early_fusion.load_state_dict(torch.load(f"model/early/early_fusion_{fold}.pt"))
         self.early_fusion.eval()
 
-        self.raw_fusion = RawFusionNetwork()
-        self.raw_fusion.load_state_dict(torch.load(f"model/raw/raw_fusion_{fold}.pt"))
-        self.raw_fusion.eval()
+        self.intermediate_fusion = IntermediateFusionNetwork(vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size'])
+        self.intermediate_fusion.load_state_dict(torch.load(f"model/intermediate/intermediate_fusion_{fold}.pt"))
+        self.intermediate_fusion.eval()
+
+        self.intermodal_inconsistency = IntermodalInconsistencyNetwork(vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size'])
+        self.intermodal_inconsistency.load_state_dict(torch.load(f"model/intermodality/intermodality_model_{fold}.pt"))
+        self.intermodal_inconsistency.eval()  
 
         # Projection layers for each modality to match attention dimensions
         self.text_proj = nn.Linear(text_dim, hidden_dim)
@@ -240,7 +262,14 @@ class HybridFusionNetwork(nn.Module):
             nn.Dropout(0.3)
         )
         
-        self.raw_proj = nn.Sequential(
+        self.intermediate_proj = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        self.intermodal_proj = nn.Sequential(
             nn.Linear(2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
@@ -268,15 +297,19 @@ class HybridFusionNetwork(nn.Module):
         # Get predictions from pretrained models
         with torch.no_grad():
             late_fusion_out = self.late_fusion(text, vision, audio)
-            early_fusion_out = self.early_fusion(text, vision, audio)
-            raw_fusion_out = self.raw_fusion(raw_text, raw_vision, raw_audio)
+            intermediate_fusion_out = self.intermediate_fusion(text, vision, audio)
+            early_fusion_out = self.raw_fusion(raw_text, raw_vision, raw_audio)
+            intermodal_out = self.intermodal_inconsistency(text, vision, audio)
 
         late_proj = self.late_proj(late_fusion_out)    # [batch_size, hidden_dim]
-        early_proj = self.early_proj(early_fusion_out)  # [batch_size, hidden_dim]
-        raw_proj = self.raw_proj(raw_fusion_out)       # [batch_size, hidden_dim]
+        intermediate_proj = self.intermediate_proj(intermediate_fusion_out)  # [batch_size, hidden_dim]
+        early_proj = self.early_proj(early_fusion_out)       # [batch_size, hidden_dim]
+
+        intermodal_proj = self.intermodal_proj(intermodal_out)  # [batch_size, hidden_dim]
         
         
-        fusion_stack = torch.stack([late_proj, early_proj, raw_proj, text_proj, vision_proj, audio_proj], dim=1)  # [batch_size, 3, hidden_dim]
+        fusion_stack = torch.stack([late_proj, early_proj, intermediate_proj, intermodal_proj, text_proj, vision_proj, audio_proj], dim=1)  # [batch_size, 3, hidden_dim]
+
 
         attended_fusion, attention_weights  = self.fusion_attention(
             fusion_stack, fusion_stack, fusion_stack
@@ -286,80 +319,106 @@ class HybridFusionNetwork(nn.Module):
 
         attention_scores = F.softmax(attention_weights.mean(dim=1), dim=-1).unsqueeze(-1)
         weighted_fusion = (attended_fusion * attention_scores).sum(dim=1)
-        # weighted_fusion = self.layer_norm2(weighted_fusion)
 
         # Final classification
         output = self.classifier(weighted_fusion)
         
         return output
+    
+class IntermodalInconsistencyNetwork(nn.Module):
+    def __init__(self, text_dim, vision_dim, audio_dim, hidden_dim=256, num_classes=2):
+        super(IntermodalInconsistencyNetwork, self).__init__()
+        
+        # Project each modality to same hidden dimension
+        self.text_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        self.vision_proj = nn.Sequential(
+            nn.Linear(vision_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        # Inconsistency detection networks for each modality pair
+        pair_input_dim = hidden_dim * 2
+        self.text_vision_compare = nn.Sequential(
+            nn.Linear(pair_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.text_audio_compare = nn.Sequential(
+            nn.Linear(pair_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.vision_audio_compare = nn.Sequential(
+            nn.Linear(pair_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # Final classifier that combines inconsistency scores
+        self.final_classifier = nn.Sequential(
+            nn.Linear(3, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+        
+    def get_inconsistency_score(self, mod1, mod2, compare_net):
+        """Calculate inconsistency score between two modalities"""
+        combined = torch.cat([mod1, mod2], dim=1)
+        return compare_net(combined)
+        
+    def forward(self, text, vision, audio):
+        # Project each modality to common space
+        text_h = self.text_proj(text)
+        vision_h = self.vision_proj(vision)
+        audio_h = self.audio_proj(audio)
+        
+        # Calculate inconsistency scores between modality pairs
+        text_vision_score = self.get_inconsistency_score(
+            text_h, vision_h, self.text_vision_compare
+        )
+        text_audio_score = self.get_inconsistency_score(
+            text_h, audio_h, self.text_audio_compare
+        )
+        vision_audio_score = self.get_inconsistency_score(
+            vision_h, audio_h, self.vision_audio_compare
+        )
+        
+        # Combine inconsistency scores
+        all_scores = torch.cat(
+            [text_vision_score, text_audio_score, vision_audio_score], 
+            dim=1
+        )
+        
+        # Final classification
+        output = self.final_classifier(all_scores)
+        
+        return output
 
-class ResidualEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(ResidualEncoder, self).__init__()
-        
-        self.input_projection = nn.Linear(input_dim, hidden_dim * 2)
-        
-        self.block1 = nn.Sequential(
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2)
-        )
-        
-        self.block2 = nn.Sequential(
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-        
-    def forward(self, x):
-        # Initial projection
-        x = self.input_projection(x)
-        
-        # First residual block
-        identity = x
-        x = self.block1(x)
-        x = x + identity  # Residual connection
-        
-        # Second block (dimension reduction, no residual)
-        x = self.block2(x)
-        
-        return x
-
-class ResidualFusion(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(ResidualFusion, self).__init__()
-        
-        self.input_projection = nn.Linear(input_dim, hidden_dim * 2)
-        
-        self.fusion_block = nn.Sequential(
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2)
-        )
-        
-        self.output_projection = nn.Sequential(
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-        
-    def forward(self, x):
-        # Project input to intermediate dimension
-        x = self.input_projection(x)
-        
-        # Residual fusion block
-        identity = x
-        x = self.fusion_block(x)
-        x = x + identity
-        
-        # Final projection
-        x = self.output_projection(x)
-        
-        return x
 
 class ResidualClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_classes):
@@ -413,7 +472,6 @@ def fit(model, train_data, val_data, fold):
             raw_text = batch_data['raw_text'].to(device)
             raw_video = batch_data['raw_video'].to(device)
             raw_audio = batch_data['raw_audio'].to(device)
-
 
             labels = batch_data['labels'].to(device)
 
@@ -514,7 +572,7 @@ def result_formatter(model_name):
         weighted_fscores.append(result["weighted avg"]["f1-score"])
         weighted_precision.append(result["weighted avg"]["precision"])
         weighted_recall.append(result["weighted avg"]["recall"])
-        print("Fold {}:".format(fold + 1))
+        print("Fold {}:".format(fold ))
         print("Weighted Precision: {}  Weighted Recall: {}  Weighted F score: {}".format(
             result["weighted avg"]["precision"],
             result["weighted avg"]["recall"],
@@ -543,7 +601,7 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         val_dataLoader = load_data(data_input, data_output, val_ind_SI,author_ind)
         test_dataLoader = load_data(data_input, data_output, test_ind_SI,author_ind)
 
-        model = HybridFusionNetwork(fold=fold) #todo: put actual values
+        model = HybridFusionNetwork(fold=fold,vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']) #todo: put actual values
         model = model.to(device)
 
         fit(model, train_dataLoader, val_dataLoader, fold)
@@ -570,12 +628,47 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         json.dump(results, file)
     print('dump results  into ', result_file.format(model_name))
 
-
+def calculate_overall_stats(results_list):
+    # Extract all metrics from all folds
+    all_metrics = {
+        'precision': [],
+        'recall': [],
+        'f1': []
+    }
     
+    # Collect metrics from each fold's results
+    for fold_results in results_list:
+        weighted_metrics = fold_results["weighted avg"]
+        all_metrics['precision'].append(weighted_metrics['precision'])
+        all_metrics['recall'].append(weighted_metrics['recall'])
+        all_metrics['f1'].append(weighted_metrics['f1-score'])
+
+    # Calculate statistics
+    stats = {}
+    for metric, values in all_metrics.items():
+        values = np.array(values)
+        stats[metric] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'variance': np.var(values)
+        }
+        print(f"{metric.capitalize()}: {np.mean(values)*100:.1f} ± {np.std(values)*100:.1f} (variance: {np.var(values)*100:.4f})")
+    
+    return stats
+
+mapping = json.load(open("mapping.json"))
+current_visual = mapping['current_visual']
+current_audio = mapping['current_audio']
+current_text = mapping['current_text']
+
+audio_map = mapping[current_audio]
+text_map = mapping[current_text]
+video_map = mapping[current_visual]
 def main():
-    video_embeddings = "video_embeddings_clip.json"
-    text_embeddings = "text_features_clip.json"
-    audio_embeddings = "audio_features_wav2vec2_bert.json"
+    
+    video_embeddings = video_map['filename']    
+    text_embeddings = text_map['filename']
+    audio_embeddings = audio_map['filename']
     sarcasm_data = "sarcasm_data.json" # DATA_PATH_JSON 
     indices_file = "split_indices.p"
     raw_data = "raw_features.json"
@@ -590,16 +683,22 @@ def main():
     split_indices = pickle_loader(indices_file)
 
 
-    model = HybridFusionNetwork().to(device) #todo: put actual values
+    model = HybridFusionNetwork(vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']).to(device) #todo: put actual values
     model = model.to(device)
-    summary(model, [(512, ), (512, ), (1024, ), (1024, ), (1024, ), (1024, )])
+    summary(model, [(text_map['size'], ), (video_map['size'], ), (audio_map['size'], ), (1024, ), (1024, ), (1024, )])
 
     five_results = []
+    
+    results_per_fold = []
 
     for i in range(5):
         five_fold(i, split_indices, model_path, result_file, device, data_input, data_output)
         model_name = 'hybrid_fusion_model_'
         model_name = model_name + str(i)
+                
+        fold_results = json.load(open(result_file.format(model_name), "rb"))
+        results_per_fold.extend(fold_results)
+
         tmp_dict = result_formatter(model_name=model_name)
         five_results.append(tmp_dict)
 
@@ -607,6 +706,10 @@ def main():
     with open(result_file.format(file_name), 'w') as file:
         json.dump(five_results, file)
     print('dump results  into ', result_file.format(file_name))
+
+    print("\nOverall Performance Statistics:")
+    stats = calculate_overall_stats(results_per_fold)
+
 
     results = json.load(open(result_file.format(file_name), "rb"))
     precisions, recalls, f1s = [], [], []

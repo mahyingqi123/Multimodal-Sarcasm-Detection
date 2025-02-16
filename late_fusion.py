@@ -10,6 +10,12 @@ import os
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 
+training = True
+
+# // Precision: 86.7 ± 7.0 (variance: 0.4958)
+# // Recall: 86.6 ± 7.1 (variance: 0.4997)
+# // F1: 86.6 ± 7.1 (variance: 0.5019)
+
 
 TEXT_INDEX = 0
 VIDEO_INDEX = 1
@@ -22,6 +28,7 @@ batch_size = 32
 learning_rate = 5e-4
 weight_decay = 0.0
 early_stop = 20
+max_epochs = 200
 model_path = 'model/late/late_fusion_'
 device = torch.device('cuda:%d' % 0 if torch.cuda.is_available() else 'cpu')
 
@@ -91,6 +98,7 @@ def load_data(data_input, data_output,train_ind_SI, author_ind):
 
     train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
     return train_dataLoader
+
 class SimpleNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(SimpleNN, self).__init__()
@@ -106,23 +114,29 @@ class SimpleNN(nn.Module):
     
 
 class LateFusionNetwork(nn.Module):
-    def __init__(self, fold = 0):
+    def __init__(self, fold = 0, vision_dim=512, text_dim=512, audio_dim=1024):
         super(LateFusionNetwork, self).__init__()
         # Deeper processing branches for each modality
-        self.text_branch = SimpleNN(512, 256, 2)
+        self.text_branch = SimpleNN(text_dim, 256, 2)
         self.text_branch.load_state_dict(torch.load('model/text/text_model_fold_'+str(fold)+'.pt'))
         self.text_branch.eval()
         
-        self.vision_branch = SimpleNN(512, 256, 2)
+        self.vision_branch = SimpleNN(vision_dim, 256, 2)
         self.vision_branch.load_state_dict(torch.load('model/visual/visual_model_fold_'+str(fold)+'.pt'))
         self.vision_branch.eval()
 
-        self.audio_branch = SimpleNN(1024, 256, 2)
+        self.audio_branch = SimpleNN(audio_dim, 256, 2)
         self.audio_branch.load_state_dict(torch.load('model/audio/audio_model_fold_'+str(fold)+'.pt'))
         self.audio_branch.eval()
         # Fusion layer
 
-        self.classifier = nn.Linear(2 * 3, 2)
+        self.attention = nn.Sequential(
+            nn.Linear(6, 16),
+            nn.ReLU(),
+            nn.Linear(16, 3)
+        )
+
+        self.classifier = nn.Linear(2, 2)
     
     def forward(self, text, vision, audio):
         # Process each modality independently
@@ -132,9 +146,51 @@ class LateFusionNetwork(nn.Module):
         
         # Concatenate and apply attention
         combined = torch.cat([text_features, vision_features, audio_features], dim=1)
+
+        attn_scores = self.attention(combined)
+        
+        # Normalize attention scores to obtain weights that sum to 1 for each sample.
+        # Shape remains (B, 3, 1)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+
+        stacked = torch.stack([text_features, vision_features, audio_features], dim=1)
+        
+        # Compute a weighted sum of the modality features.
+        # Multiply each modality's feature vector by its attention weight, then sum along the modality dimension.
+        # Resulting shape: (B, 2)
+        attended_features = (stacked * attn_weights.unsqueeze(-1)).sum(dim=1)
         
         # Final classification
-        return self.classifier(combined)
+        return self.classifier(attended_features)
+
+    
+def calculate_overall_stats(results_list):
+    # Extract all metrics from all folds
+    all_metrics = {
+        'precision': [],
+        'recall': [],
+        'f1': []
+    }
+    
+    # Collect metrics from each fold's results
+    for fold_results in results_list:
+        weighted_metrics = fold_results["weighted avg"]
+        all_metrics['precision'].append(weighted_metrics['precision'])
+        all_metrics['recall'].append(weighted_metrics['recall'])
+        all_metrics['f1'].append(weighted_metrics['f1-score'])
+
+    # Calculate statistics
+    stats = {}
+    for metric, values in all_metrics.items():
+        values = np.array(values)
+        stats[metric] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'variance': np.var(values)
+        }
+        print(f"{metric.capitalize()}: {np.mean(values)*100:.1f} ± {np.std(values)*100:.1f} (variance: {np.var(values)*100:.4f})")
+    
+    return stats
 
 
     
@@ -143,6 +199,7 @@ def fit(model, train_data, val_data, fold):
     epochs, best_epoch = 0, 0
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    best_loss = np.inf
     while True:
         epochs += 1
         y_pred, y_true = [], []
@@ -177,16 +234,26 @@ def fit(model, train_data, val_data, fold):
         train_loss = train_loss / len(pred)
 
         train_acc = train_acc / len(pred)
-        val_acc, _, _ = test(model, val_data, mode="VAL")
-        if val_acc > best_acc:
-            best_acc, best_epoch = val_acc, epochs
-            if os.path.exists(model_path):
-                os.remove(model_path)
-            torch.save(model.cpu().state_dict(), model_path+str(fold)+'.pt')
-            model.to(device)
+
+        if training:
+            if train_loss < best_loss:
+                best_loss = train_loss
+                best_acc = train_acc
+                best_epoch = epochs
+                torch.save(model.cpu().state_dict(), model_path+str(fold)+'.pt')
+                model.to(device)
+
+        else: 
+            val_acc, _, _ = test(model, val_data, mode="VAL")
+            if val_acc > best_acc:
+                best_acc, best_epoch = val_acc, epochs
+                if os.path.exists(model_path):
+                    os.remove(model_path)
+                torch.save(model.cpu().state_dict(), model_path+str(fold)+'.pt')
+                model.to(device)
 
         # early stop
-        if epochs - best_epoch >= early_stop:
+        if epochs - best_epoch >= early_stop or epochs >= max_epochs:
             return
 
 def test(model, test_data , mode="VAL"):
@@ -250,7 +317,7 @@ def result_formatter(model_name):
         weighted_fscores.append(result["weighted avg"]["f1-score"])
         weighted_precision.append(result["weighted avg"]["precision"])
         weighted_recall.append(result["weighted avg"]["recall"])
-        print("Fold {}:".format(fold + 1))
+        print("Fold {}:".format(fold ))
         print("Weighted Precision: {}  Weighted Recall: {}  Weighted F score: {}".format(
             result["weighted avg"]["precision"],
             result["weighted avg"]["recall"],
@@ -279,7 +346,7 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         val_dataLoader = load_data(data_input, data_output, val_ind_SI,author_ind)
         test_dataLoader = load_data(data_input, data_output, test_ind_SI,author_ind)
 
-        model = LateFusionNetwork(fold+1) #todo: put actual values
+        model = LateFusionNetwork(fold,vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']) 
         model = model.to(device)
 
         fit(model, train_dataLoader, val_dataLoader, fold)
@@ -306,12 +373,19 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         json.dump(results, file)
     print('dump results  into ', result_file.format(model_name))
 
+mapping = json.load(open("mapping.json"))
+current_visual = mapping['current_visual']
+current_audio = mapping['current_audio']
+current_text = mapping['current_text']
 
-    
+audio_map = mapping[current_audio]
+text_map = mapping[current_text]
+video_map = mapping[current_visual]
 def main():
-    video_embeddings = "video_embeddings_clip.json"
-    text_embeddings = "text_features_clip.json"
-    audio_embeddings = "audio_features_wav2vec2_bert.json"
+    
+    video_embeddings = video_map['filename']    
+    text_embeddings = text_map['filename']
+    audio_embeddings = audio_map['filename']
     sarcasm_data = "sarcasm_data.json" # DATA_PATH_JSON 
     indices_file = "split_indices.p"
 
@@ -322,22 +396,24 @@ def main():
 
     data_input, data_output = group_data(dataset_json, text_features, video_features,audio_features)
 
-    skf = StratifiedKFold(n_splits=splits, shuffle=True)
-    split_indices = [(train_index, test_index) for train_index, test_index in skf.split(data_input, data_output)]
-
     split_indices = pickle_loader(indices_file)
 
 
-    model = LateFusionNetwork(1).to(device)
+    model = LateFusionNetwork(1,vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']).to(device) #todo: put actual values
     model = model.to(device)
-    summary(model, [(512, ), (512, ), (1024, )])
+    summary(model, [(text_map['size'], ), (video_map['size'], ), (audio_map['size'], )])
 
     five_results = []
+    results_per_fold = []
 
     for i in range(5):
         five_fold(i, split_indices, model_path, result_file, device, data_input, data_output)
         model_name = 'late_fusion_model_'
         model_name = model_name + str(i)
+        
+        fold_results = json.load(open(result_file.format(model_name), "rb"))
+        results_per_fold.extend(fold_results)
+
         tmp_dict = result_formatter(model_name=model_name)
         five_results.append(tmp_dict)
 
@@ -345,6 +421,9 @@ def main():
     with open(result_file.format(file_name), 'w') as file:
         json.dump(five_results, file)
     print('dump results  into ', result_file.format(file_name))
+
+    print("\nOverall Performance Statistics:")
+    stats = calculate_overall_stats(results_per_fold)
 
     results = json.load(open(result_file.format(file_name), "rb"))
     precisions, recalls, f1s = [], [], []

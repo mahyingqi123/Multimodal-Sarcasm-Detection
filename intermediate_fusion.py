@@ -10,7 +10,7 @@ import os
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
 
-training = True
+training = True 
 
 
 TEXT_INDEX = 0
@@ -24,10 +24,10 @@ batch_size = 32
 learning_rate = 5e-4
 weight_decay = 0.0
 early_stop = 20
-model_path = 'model/early/early_fusion_'
+model_path = 'model/intermediate/intermediate_fusion_'
 device = torch.device('cuda:%d' % 0 if torch.cuda.is_available() else 'cpu')
 
-result_file = "result/early_fusion/{}.json"
+result_file = "result/intermediate_fusion/{}.json"
 
 def oneHot(data, size=None):
     '''
@@ -65,9 +65,9 @@ def group_data(dataset, text, video, audio):
     
     for id in dataset.keys():
         data_input.append(
-            (text[id]['text'],  # 0 TEXT_ID
-             video[id]['visual'],  # 1 VIDEO_ID
-             audio[id]['audio'],           # 2
+            (text[id],  # 0 TEXT_ID
+             video[id],  # 1 VIDEO_ID
+             audio[id],           # 2
              dataset[id]["show"],      # 3 SHOW_ID
              dataset[id]["speaker"],           # 4
              ))
@@ -94,9 +94,9 @@ def load_data(data_input, data_output,train_ind_SI, author_ind):
     train_dataLoader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, shuffle=True)
     return train_dataLoader
 
-class EarlyFusionNetwork(nn.Module):
-    def __init__(self, text_dim=1024, vision_dim=1024, audio_dim=1024, hidden_dim=256, num_classes=2):
-        super(EarlyFusionNetwork, self).__init__()
+class IntermediateFusionNetwork(nn.Module):
+    def __init__(self, text_dim=512, vision_dim=512, audio_dim=1024, hidden_dim=256, num_classes=2):
+        super(IntermediateFusionNetwork, self).__init__()
         
         total_dim = text_dim + vision_dim + audio_dim
         self.fusion = nn.Sequential(
@@ -172,7 +172,7 @@ def fit(model, train_data, val_data,fold):
                 model.to(device)
 
         # early stop
-        if epochs - best_epoch >= early_stop or epochs >= 200:
+        if epochs - best_epoch >= early_stop:
             return
 
 def test(model, test_data , mode="VAL"):
@@ -265,7 +265,7 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         val_dataLoader = load_data(data_input, data_output, val_ind_SI,author_ind)
         test_dataLoader = load_data(data_input, data_output, test_ind_SI,author_ind)
 
-        model = EarlyFusionNetwork() #todo: put actual values
+        model = IntermediateFusionNetwork(vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']) #todo: put actual values
         model = model.to(device)
 
         fit(model, train_dataLoader, val_dataLoader, fold)
@@ -284,7 +284,7 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         result_dict = classification_report(y_true, y_pred, digits=3, output_dict=True)
         results.append(result_dict)
 
-    model_name = 'early_fusion_model_'
+    model_name = 'intermediate_fusion_model_'
     model_name = model_name + str(index)
     if not os.path.exists(os.path.dirname(result_file)):
         os.makedirs(os.path.dirname(result_file))
@@ -292,12 +292,48 @@ def five_fold(index, split_indices, model_path, result_file, device, data_input,
         json.dump(results, file, indent=4)
     print('dump results  into ', result_file.format(model_name))
 
-
+def calculate_overall_stats(results_list):
+    # Extract all metrics from all folds
+    all_metrics = {
+        'precision': [],
+        'recall': [],
+        'f1': []
+    }
     
+    # Collect metrics from each fold's results
+    for fold_results in results_list:
+        weighted_metrics = fold_results["weighted avg"]
+        all_metrics['precision'].append(weighted_metrics['precision'])
+        all_metrics['recall'].append(weighted_metrics['recall'])
+        all_metrics['f1'].append(weighted_metrics['f1-score'])
+
+    # Calculate statistics
+    stats = {}
+    for metric, values in all_metrics.items():
+        values = np.array(values)
+        stats[metric] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'variance': np.var(values)
+        }
+        print(f"{metric.capitalize()}: {np.mean(values)*100:.1f} ± {np.std(values)*100:.1f} (variance: {np.var(values)*100:.4f})")
+    
+    return stats
+
+
+mapping = json.load(open("mapping.json"))
+current_visual = mapping['current_visual']
+current_audio = mapping['current_audio']
+current_text = mapping['current_text']
+
+audio_map = mapping[current_audio]
+text_map = mapping[current_text]
+video_map = mapping[current_visual]
 def main():
-    video_embeddings = "raw_features.json"
-    text_embeddings = "raw_features.json"
-    audio_embeddings = "raw_features.json"
+    
+    video_embeddings = video_map['filename']    
+    text_embeddings = text_map['filename']
+    audio_embeddings = audio_map['filename']
     sarcasm_data = "sarcasm_data.json" # DATA_PATH_JSON 
     indices_file = "split_indices.p"
 
@@ -313,23 +349,31 @@ def main():
     split_indices = pickle_loader(indices_file)
 
 
-    model = EarlyFusionNetwork().to(device) #todo: put actual values
+    model = IntermediateFusionNetwork(vision_dim=video_map['size'], text_dim=text_map['size'], audio_dim=audio_map['size']).to(device) #todo: put actual values
     model = model.to(device)
-    summary(model, [(1024, ), (1024, ), (1024, )])
+    summary(model, [(text_map['size'], ), (video_map['size'], ), (audio_map['size'], )])
 
     five_results = []
+    results_per_fold = []
 
     for i in range(5):
         five_fold(i, split_indices, model_path, result_file, device, data_input, data_output)
-        model_name = 'early_fusion_model_'
+        model_name = 'intermediate_fusion_model_'
         model_name = model_name + str(i)
         tmp_dict = result_formatter(model_name=model_name)
+
+        fold_results = json.load(open(result_file.format(model_name), "rb"))
+        results_per_fold.extend(fold_results)
+
         five_results.append(tmp_dict)
 
     file_name = 'five_results'
     with open(result_file.format(file_name), 'w') as file:
         json.dump(five_results, file)
     print('dump results  into ', result_file.format(file_name))
+
+    print("\nOverall Performance Statistics:")
+    stats = calculate_overall_stats(results_per_fold)
 
     results = json.load(open(result_file.format(file_name), "rb"))
     precisions, recalls, f1s = [], [], []
